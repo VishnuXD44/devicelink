@@ -1,0 +1,479 @@
+#!/bin/bash
+# devicelink — attach an iPhone plugged into a remote Windows PC to this Mac.
+#
+# The phone stays plugged into Windows. Apple's own Mobile Device Service there
+# already speaks the usbmux protocol over TCP 127.0.0.1:27015, so no third-party
+# software is needed on that side. An SSH reverse tunnel carries that port here,
+# and usbfluxd swaps this Mac's /var/run/usbmuxd for one that forwards to it —
+# at which point Xcode, Finder, and every libimobiledevice tool see the device
+# as if it were plugged into this machine.
+#
+#   Windows                                  this Mac
+#   iPhone → AMDS :27015 ──ssh -R──▶ 127.0.0.1:PORT ──usbfluxd──▶ /var/run/usbmuxd ──▶ Xcode
+#
+# Usage: devicelink <install|up|down|status|doctor|repair> [options]
+
+set -uo pipefail
+
+# Resolve $0 through symlinks: probe.py, selftest.sh and windows/devicelink.ps1
+# live next to the real script, and `ln -s devicelink ~/.local/bin/` is how a
+# single-file tool gets onto PATH. Without this, $0 is the link and the siblings
+# are looked for in the wrong directory.
+SELF="$0"
+while [ -L "$SELF" ]; do
+    link="$(readlink "$SELF")"
+    case "$link" in
+        /*) SELF="$link" ;;
+        *)  SELF="$(dirname "$SELF")/$link" ;;
+    esac
+done
+SCRIPT_DIR="$(cd "$(dirname "$SELF")" && pwd)"
+
+PORT="${DEVICELINK_PORT:-27015}"
+SOCKET="/var/run/usbmuxd"
+SOCKET_ORIG="/var/run/usbmuxd.orig"
+STATE_DIR="${TMPDIR:-/tmp}/devicelink"
+LOG="$STATE_DIR/usbfluxd.log"
+PIDFILE="$STATE_DIR/usbfluxd.pid"
+
+mkdir -p "$STATE_DIR"
+
+bold()  { printf "\033[1m%s\033[0m\n" "$*"; }
+ok()    { printf "  \033[32m✓\033[0m %s\n" "$*"; }
+warn()  { printf "  \033[33m!\033[0m %s\n" "$*"; }
+fail()  { printf "  \033[31m✗\033[0m %s\n" "$*"; }
+info()  { printf "    %s\n" "$*"; }
+
+die() { printf "\033[31merror:\033[0m %s\n" "$*" >&2; exit 1; }
+
+usage() {
+    # Print the leading comment block only, stopping at the first non-comment line.
+    awk 'NR>1 { if ($0 !~ /^#/) exit; sub(/^# ?/, ""); print }' "$SELF"
+    cat <<'EOF'
+
+Commands
+  install   Build and install usbfluxd and its dependencies
+  up        Start the bridge (run this BEFORE opening Xcode)
+  down      Stop the bridge and restore the original usbmuxd socket
+  status    Show whether the bridge and tunnel are live
+  doctor    Diagnose the whole chain and explain what to fix
+  selftest  Prove the bridge works without a phone or a Windows PC
+  watch     Live monitor of connects/disconnects, with auto-repair
+  wait      Block until a device is reachable (for scripts)
+  windows   Print copy-paste commands to get set up on the Windows side
+  repair    Restore /var/run/usbmuxd after a crash
+
+Options
+  --port N        Tunnel port on this Mac (default 27015; DEVICELINK_PORT to persist)
+  --emit-base64   With 'windows': write a paste-safe blob of devicelink.ps1
+  --timeout N     With 'wait': seconds before giving up (default 120)
+
+On the Windows side, run windows/devicelink.ps1 to open the tunnel.
+EOF
+}
+
+# --- helpers ---------------------------------------------------------------
+
+port_listening() { lsof -iTCP:"$1" -sTCP:LISTEN -n >/dev/null 2>&1; }
+
+usbfluxd_running() { pgrep -x usbfluxd >/dev/null 2>&1; }
+
+# The bridge is only meaningful if the tunnel actually reaches a usbmux speaker.
+tunnel_reachable() { nc -z -G 2 127.0.0.1 "$PORT" >/dev/null 2>&1; }
+
+require_binaries() {
+    command -v usbfluxd >/dev/null 2>&1 || die "usbfluxd not installed. Run: devicelink install"
+    command -v idevice_id >/dev/null 2>&1 || die "libimobiledevice not installed. Run: devicelink install"
+}
+
+# --- commands --------------------------------------------------------------
+
+cmd_install() {
+    bold "Installing dependencies"
+    command -v brew >/dev/null 2>&1 || die "Homebrew is required: https://brew.sh"
+    brew install libimobiledevice libplist automake autoconf libtool pkg-config socat || die "brew install failed"
+
+    if command -v usbfluxd >/dev/null 2>&1; then
+        ok "usbfluxd already installed at $(command -v usbfluxd)"
+        return 0
+    fi
+
+    bold "Building usbfluxd"
+    local src="$(cd "$SCRIPT_DIR/../usbfluxd-src" 2>/dev/null && pwd)"
+    if [ -z "$src" ]; then
+        src="$STATE_DIR/usbfluxd-src"
+        rm -rf "$src"
+        git clone --depth 1 https://github.com/corellium/usbfluxd.git "$src" || die "clone failed"
+    fi
+
+    ( cd "$src" && ./autogen.sh && make ) || die "build failed"
+
+    # `make install` skips the binary on some autotools versions; copy explicitly.
+    sudo cp "$src/usbfluxd/usbfluxd" /usr/local/bin/usbfluxd || die "install failed"
+    sudo cp "$src/tools/usbfluxctl" /usr/local/bin/usbfluxctl || die "install failed"
+    sudo chmod 755 /usr/local/bin/usbfluxd /usr/local/bin/usbfluxctl
+
+    ok "installed $(usbfluxd --version 2>&1 | head -1)"
+}
+
+cmd_up() {
+    require_binaries
+
+    if usbfluxd_running; then
+        warn "bridge already running"
+        cmd_status
+        return 0
+    fi
+
+    # Guard against the state a crashed run leaves behind.
+    if [ -e "$SOCKET_ORIG" ] && [ ! -e "$SOCKET" ]; then
+        die "previous run left the socket moved aside. Run: devicelink repair"
+    fi
+
+    if ! tunnel_reachable; then
+        fail "nothing is listening on 127.0.0.1:$PORT"
+        info "Open the tunnel from Windows first:"
+        info "  ssh -R $PORT:127.0.0.1:27015 $(whoami)@$(hostname)"
+        info "or run windows/devicelink.ps1 there. See: devicelink windows"
+        return 1
+    fi
+
+    bold "Starting bridge on port $PORT"
+    sudo /usr/local/bin/usbfluxd -f -v -m -r "127.0.0.1:$PORT" >"$LOG" 2>&1 &
+    echo $! >"$PIDFILE"
+
+    # usbfluxd needs a moment to rename the socket and connect to the remote.
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+        sleep 0.5
+        usbfluxd_running && break
+    done
+
+    if ! usbfluxd_running; then
+        fail "usbfluxd failed to start"
+        info "log: $LOG"
+        tail -5 "$LOG" 2>/dev/null | sed 's/^/    /'
+        return 1
+    fi
+
+    ok "bridge up"
+    sleep 1
+    local devices
+    devices=$(idevice_id -l 2>/dev/null)
+    if [ -n "$devices" ]; then
+        ok "device visible: $devices"
+        bold "You can open Xcode now."
+    else
+        warn "bridge is up but no device is visible yet"
+        info "Check the phone is unlocked and you tapped Trust on it."
+        info "First attach also syncs ~4 GB of symbols — allow 15-20 minutes."
+    fi
+}
+
+cmd_down() {
+    if ! usbfluxd_running; then
+        warn "bridge is not running"
+    else
+        bold "Stopping bridge"
+        # SIGTERM lets usbfluxd restore the original socket itself.
+        sudo pkill -TERM -x usbfluxd
+        for _ in 1 2 3 4 5 6; do
+            sleep 0.5
+            usbfluxd_running || break
+        done
+        usbfluxd_running && sudo pkill -KILL -x usbfluxd
+        ok "stopped"
+    fi
+
+    rm -f "$PIDFILE"
+
+    if [ -e "$SOCKET_ORIG" ]; then
+        warn "original socket still moved aside; repairing"
+        cmd_repair
+    else
+        ok "usbmuxd socket intact"
+    fi
+}
+
+cmd_repair() {
+    bold "Repairing usbmuxd socket"
+    if [ ! -e "$SOCKET_ORIG" ]; then
+        ok "nothing to repair — $SOCKET_ORIG is absent"
+        return 0
+    fi
+    usbfluxd_running && die "usbfluxd is still running. Run: devicelink down"
+
+    sudo rm -f "$SOCKET"
+    sudo mv "$SOCKET_ORIG" "$SOCKET" || die "could not restore $SOCKET"
+    ok "restored $SOCKET"
+    info "If iOS tooling still misbehaves, reboot to let launchd recreate it."
+}
+
+# Only devicelink.ps1 needs to reach Windows; everything else runs here.
+cmd_windows() {
+    local ps1 mac_addr
+    ps1="$SCRIPT_DIR/windows/devicelink.ps1"
+
+    # On a cloud Mac the public address is what Windows must dial, and `hostname`
+    # does not know it. Off EC2 this lookup just times out and we fall back.
+    mac_addr=$(curl -s -m 3 -H "X-aws-ec2-metadata-token: $(curl -s -m 3 -X PUT \
+        'http://169.254.169.254/latest/api/token' \
+        -H 'X-aws-ec2-metadata-token-ttl-seconds: 60' 2>/dev/null)" \
+        http://169.254.169.254/latest/meta-data/public-ipv4 2>/dev/null)
+    mac_addr="${mac_addr:-$(hostname)}"
+    local user="$(whoami)"
+
+    # Whatever key this Mac already trusts is the one Windows needs, and a key's
+    # comment field is conventionally its name — so the file to hunt for over
+    # there is usually <that name>.pem.
+    local keyname
+    keyname=$(awk '{print $3}' ~/.ssh/authorized_keys 2>/dev/null | head -1)
+    keyname="${keyname:-your-key}"
+    local keypath="C:\\Users\\<you>\\Downloads\\${keyname}.pem"
+
+    bold "Getting devicelink onto Windows"
+    info "Only one file needs to move: devicelink.ps1"
+    info "The bridge itself, and this CLI, stay on the Mac."
+    echo
+
+    bold "Fastest path — no files at all"
+    info "The tunnel is one command. Run this in PowerShell and you are live:"
+    echo
+    printf '    %s\n' "ssh -N -R ${PORT}:127.0.0.1:${PORT} ${user}@${mac_addr} -i ${keypath}"
+    echo
+    info "This Mac trusts the key named '${keyname}', so look for ${keyname}.pem."
+    info "Keys living in Downloads inherit ACLs that OpenSSH rejects. Fix once:"
+    printf '    %s\n' "icacls ${keypath} /inheritance:r /grant:r \"\$env:USERNAME:(R)\""
+    info "Then run 'devicelink up' here. The .ps1 only adds preflight checks and"
+    info "auto-reconnect — useful, but not required to get working."
+    echo
+
+    bold "Option A — scp (recommended; Windows 10/11 ships it)"
+    echo
+    printf "    scp %s@%s:%s .\n" "$user" "$mac_addr" "$ps1"
+    echo
+
+    bold "Option B — no scp, reuse the SSH session"
+    echo
+    printf "    ssh %s@%s \"cat %s\" | Out-File -Encoding utf8 devicelink.ps1\n" \
+        "$user" "$mac_addr" "$ps1"
+    echo
+
+    bold "Option C — clipboard fallback (works over VNC/console)"
+    info "Open this file, select all, copy, and paste into a new file on Windows:"
+    printf "    %s\n" "$ps1"
+    info "Or run 'devicelink windows --emit-base64' for a paste-safe blob."
+    echo
+
+    bold "Then, on Windows"
+    info "PowerShell blocks unsigned scripts by default, and files copied from"
+    info "elsewhere get flagged. Both are handled by:"
+    echo
+    # printf interprets backslash escapes in the format string, and Windows paths
+    # are full of them — pass these through as %s arguments instead.
+    printf '    %s\n' 'Unblock-File .\devicelink.ps1'
+    printf '    %s\n' "powershell -ExecutionPolicy Bypass -File .\\devicelink.ps1 -MacHost $mac_addr -IdentityFile C:\\path\\to\\key.pem"
+    echo
+    info "Security group: only port 22 needs to be open, which it already is"
+    info "since you are connected. The reverse tunnel rides that same connection."
+}
+
+cmd_emit_base64() {
+    local out
+    out="$STATE_DIR/devicelink.ps1.b64.txt"
+    base64 -i "$SCRIPT_DIR/windows/devicelink.ps1" | tr -d '\n' > "$out"
+    bold "Paste-safe bundle written"
+    info "$out  ($(wc -c < "$out" | tr -d ' ') chars)"
+    echo
+    info "Copy its contents, then on Windows run:"
+    echo
+    printf '    $b64 = "<paste here>"\n'
+    printf '    [IO.File]::WriteAllBytes("devicelink.ps1", [Convert]::FromBase64String($b64))\n'
+}
+
+
+# --- connection state -------------------------------------------------------
+# "No device" has four causes needing four different fixes; probe.py tells them
+# apart by actually speaking usbmux to the far end.
+
+probe_state() { "$SCRIPT_DIR/probe.py" "$PORT" 2>/dev/null | head -1; }
+probe_devices() { "$SCRIPT_DIR/probe.py" "$PORT" 2>/dev/null | tail -n +2; }
+
+state_explain() {
+    case "$1" in
+        READY)        echo "device connected" ;;
+        NO_DEVICE)    echo "tunnel and Apple service are up, but no phone — unlock it, replug it, or re-tap Trust" ;;
+        FAR_END_DEAD) echo "tunnel is up but nothing is answering — Apple Mobile Device Service stopped on Windows" ;;
+        TUNNEL_DOWN)  echo "no SSH tunnel — rerun devicelink.ps1 on Windows" ;;
+        *)            echo "unknown state" ;;
+    esac
+}
+
+# usbfluxd caches a remote's device list; re-adding forces it to resync after the
+# far end comes back. This is the only failure we can actually repair from here.
+repair_remote() {
+    usbfluxctl del "127.0.0.1:$PORT" >/dev/null 2>&1
+    sleep 0.5
+    usbfluxctl add "127.0.0.1:$PORT" >/dev/null 2>&1
+}
+
+cmd_wait() {
+    local timeout="${WAIT_TIMEOUT:-120}" waited=0 last="" last_seen=""
+    while [ "$waited" -lt "$timeout" ]; do
+        local state; state=$(probe_state)
+        if [ "$state" = "READY" ]; then
+            [ -n "$last" ] && ok "device back after ${waited}s"
+            return 0
+        fi
+        if [ "$state" != "$last" ]; then
+            warn "$(state_explain "$state")"
+            last="$state"
+        fi
+        # Two different repairs: a stale cache needs a nudge, but a tunnel that
+        # dropped deregisters the remote from usbfluxd and needs re-adding.
+        if [ "$last_seen" = "TUNNEL_DOWN" ] && [ "$state" != "TUNNEL_DOWN" ]; then
+            repair_remote
+        elif [ "$state" = "NO_DEVICE" ] && [ $((waited % 10)) -eq 0 ]; then
+            repair_remote
+        fi
+        last_seen="$state"
+        sleep 2
+        waited=$((waited + 2))
+    done
+    fail "gave up after ${timeout}s waiting for a device"
+    return 1
+}
+
+cmd_watch() {
+    bold "Watching the bridge on port $PORT — Ctrl-C to stop"
+    local last="" prev="" repairs=0
+    trap 'echo; ok "stopped watching"; exit 0' INT TERM
+    while :; do
+        local state; state=$(probe_state)
+        if [ "$state" != "$last" ]; then
+            local stamp; stamp=$(date "+%H:%M:%S")
+            case "$state" in
+                READY)
+                    printf "  \033[32m%s  connected\033[0m  %s\n" "$stamp" "$(probe_devices | tr '\n' ' ')"
+                    repairs=0 ;;
+                NO_DEVICE)
+                    printf "  \033[33m%s  device gone\033[0m  %s\n" "$stamp" "$(state_explain "$state")" ;;
+                FAR_END_DEAD)
+                    printf "  \033[33m%s  far end dead\033[0m %s\n" "$stamp" "$(state_explain "$state")" ;;
+                TUNNEL_DOWN)
+                    printf "  \033[31m%s  tunnel down\033[0m  %s\n" "$stamp" "$(state_explain "$state")" ;;
+            esac
+            last="$state"
+        fi
+        # A returning tunnel must be re-registered with usbfluxd; a stale device
+        # list just needs a nudge. Cap the nudges so we don't hammer forever.
+        if [ "$prev" = "TUNNEL_DOWN" ] && [ "$state" != "TUNNEL_DOWN" ]; then
+            repair_remote
+            printf "  \033[36m%s  re-registering remote after tunnel returned\033[0m\n" "$(date '+%H:%M:%S')"
+            repairs=0
+        elif [ "$state" = "NO_DEVICE" ] && [ "$repairs" -lt 3 ]; then
+            repair_remote
+            repairs=$((repairs + 1))
+        fi
+        prev="$state"
+        sleep 3
+    done
+}
+
+cmd_status() {
+    bold "devicelink status"
+    usbfluxd_running && ok "usbfluxd running" || fail "usbfluxd not running"
+    tunnel_reachable  && ok "tunnel listening on 127.0.0.1:$PORT" \
+                      || fail "no tunnel on 127.0.0.1:$PORT"
+    [ -e "$SOCKET_ORIG" ] && warn "socket is swapped ($SOCKET_ORIG present)" \
+                          || ok "socket state normal"
+
+    if command -v idevice_id >/dev/null 2>&1; then
+        local devices
+        devices=$(idevice_id -l 2>/dev/null)
+        [ -n "$devices" ] && ok "devices: $devices" || warn "no devices visible"
+    fi
+}
+
+cmd_doctor() {
+    bold "1. Local tooling"
+    command -v usbfluxd  >/dev/null 2>&1 && ok "usbfluxd installed"  || fail "usbfluxd missing — run: devicelink install"
+    command -v idevice_id>/dev/null 2>&1 && ok "libimobiledevice installed" || fail "libimobiledevice missing"
+    command -v xcrun     >/dev/null 2>&1 && ok "Xcode tools present" || warn "Xcode command line tools missing"
+    [ -e "$SOCKET" ] && ok "$SOCKET exists" || fail "$SOCKET missing — usbmuxd is not running"
+
+    bold "2. Port $PORT"
+    if port_listening "$PORT"; then
+        ok "something is listening"
+        lsof -iTCP:"$PORT" -sTCP:LISTEN -n 2>/dev/null | tail -n +2 | awk '{print "    " $1 " (pid " $2 ")"}'
+    else
+        fail "nothing listening — the Windows tunnel is not connected"
+        info "On Windows: ssh -R $PORT:127.0.0.1:27015 $(whoami)@<this-mac>"
+    fi
+
+    # Port 5000 is the classic macOS trap: AirPlay Receiver holds it.
+    if [ "$PORT" = "5000" ]; then
+        warn "port 5000 is used by macOS AirPlay Receiver (ControlCenter)"
+        info "Pick another port, e.g. --port 27015, or disable AirPlay Receiver."
+    fi
+
+    bold "3. Bridge"
+    if usbfluxd_running; then
+        ok "usbfluxd running"
+        usbfluxctl list 2>/dev/null | sed 's/^/    /'
+    else
+        warn "usbfluxd not running — run: devicelink up"
+    fi
+
+    bold "4. Devices"
+    local devices
+    devices=$(idevice_id -l 2>/dev/null)
+    if [ -n "$devices" ]; then
+        ok "visible: $devices"
+    else
+        warn "none visible"
+        info "Common causes, in order of likelihood:"
+        info "  - tunnel not open from Windows"
+        info "  - phone locked, or Trust not tapped"
+        info "  - Apple Devices app / iTunes not installed on Windows (provides AMDS)"
+        info "  - Xcode was opened before the bridge; quit and reopen it"
+    fi
+
+    bold "5. Phone → Mac networking (not what the bridge does)"
+    local iface addr
+    iface=$(route -n get default 2>/dev/null | awk '/interface:/{print $2}')
+    addr=$([ -n "$iface" ] && ipconfig getifaddr "$iface" 2>/dev/null)
+    info "USB forwarding puts your app on the phone. It does not give the phone"
+    info "network access to this Mac, so an app calling a dev server here will"
+    info "still fail. This Mac is at ${addr:-<private address>}, which the phone"
+    info "cannot route to. Put both on a Tailscale tailnet and point the app at"
+    info "this Mac's tailnet address."
+}
+
+# --- entry -----------------------------------------------------------------
+
+COMMAND="${1:-}"; shift || true
+EMIT_B64=0
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --port) PORT="${2:?--port needs a value}"; shift 2 ;;
+        --emit-base64) EMIT_B64=1; shift ;;
+        --timeout) WAIT_TIMEOUT="${2:?--timeout needs a value}"; shift 2 ;;
+        -h|--help) usage; exit 0 ;;
+        *) die "unknown option: $1" ;;
+    esac
+done
+
+case "$COMMAND" in
+    install)  cmd_install ;;
+    up)       cmd_up ;;
+    down)     cmd_down ;;
+    status)   cmd_status ;;
+    doctor)   cmd_doctor ;;
+    repair)   cmd_repair ;;
+    selftest) exec "$SCRIPT_DIR/selftest.sh" "$PORT" ;;
+    windows)  [ "$EMIT_B64" = "1" ] && cmd_emit_base64 || cmd_windows ;;
+    watch)    cmd_watch ;;
+    wait)     cmd_wait ;;
+    ""|-h|--help) usage ;;
+    *) die "unknown command: $COMMAND (try --help)" ;;
+esac
